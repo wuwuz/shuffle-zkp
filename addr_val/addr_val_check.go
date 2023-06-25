@@ -3,23 +3,36 @@ package main
 import (
 	"fmt"
 	"log"
+	"math"
 	"math/rand"
 	"time"
 
 	"github.com/consensys/gnark-crypto/ecc"
 	fr_bn254 "github.com/consensys/gnark-crypto/ecc/bn254/fr"
+	"github.com/consensys/gnark-crypto/hash"
 	"github.com/consensys/gnark/backend/groth16"
 	"github.com/consensys/gnark/backend/witness"
+	"github.com/consensys/gnark/constraint"
 	"github.com/consensys/gnark/frontend"
 	"github.com/consensys/gnark/frontend/cs/r1cs"
+	"github.com/consensys/gnark/std/hash/mimc"
 )
 
 const (
-	PrivateVecLength = 100
-	DummyVecLength   = 60
-	PublicThreshold  = 2000
-	ClientNum        = 100
+	// 5 private inputs
+	PrivateTxNum    = 20
+	PublicThreshold = 2000
+	ClientNum       = 100
+	CorruptedNum    = 0
+	e               = 2.71828182845904523536028747135266249775724709369995
 )
+
+var DummyVecLength uint64
+
+func ComputeDummyNum(lambda uint64, n uint64, t uint64) uint64 {
+	tmp := float64(2*lambda+254)/float64(math.Log2(float64(n-t))-math.Log2(e)) + 2
+	return uint64(math.Ceil(tmp))
+}
 
 func PolyEval(vec []fr_bn254.Element, r fr_bn254.Element) fr_bn254.Element {
 	prod := vec[0]
@@ -40,38 +53,80 @@ func PolyEvalInCircuit(api frontend.API, vec []frontend.Variable, publicR fronte
 	return prod
 }
 
-type AddrSumCheckCircuit struct {
-	PrivateSrc      []frontend.Variable
-	PrivateDst      []frontend.Variable
-	PrivateAmount   []frontend.Variable
+type PrivateTx struct {
+	Send    fr_bn254.Element
+	Recv    fr_bn254.Element
+	Amt     fr_bn254.Element
+	Tx_salt fr_bn254.Element
+}
+
+type PrivateTxVar struct {
+	Send    frontend.Variable
+	Recv    frontend.Variable
+	Amt     frontend.Variable
+	Tx_salt frontend.Variable
+}
+
+type PerAddressCheckCircuit struct {
+	PrivateTxs  []PrivateTxVar
+	PrivateHash []frontend.Variable
+	/*
+		PrivateSender []frontend.Variable
+		PrivateRecv   []frontend.Variable
+		PrivateAmt    []frontend.Variable
+		PrivateTxSalt []frontend.Variable
+		PrivateHash   []frontend.Variable
+	*/
+
 	PublicThreshold frontend.Variable `gnark:",public"`
 
 	// The following are for the polynomial evaluation
-	DummyVec   []frontend.Variable
-	PublicR    frontend.Variable `gnark:",public"`
-	PublicProd frontend.Variable `gnark:",public"`
+	PrivateMask frontend.Variable
+	PublicR     frontend.Variable `gnark:",public"`
+	PublicProd  frontend.Variable `gnark:",public"`
+
+	// The following are for the commitment
+	PublicCommitment frontend.Variable `gnark:",public"`
+	PrivateSalt      frontend.Variable
 }
 
-func (circuit *AddrSumCheckCircuit) Define(api frontend.API) error {
-	//assert error if privateVec is empty
+func (circuit *PerAddressCheckCircuit) Define(api frontend.API) error {
+	//First check that each tx corresponds to a valid hash
+	for i := 0; i < len(circuit.PrivateTxs); i++ {
+		mimc, _ := mimc.NewMiMC(api)
+		mimc.Write(circuit.PrivateTxs[i].Send)
+		mimc.Write(circuit.PrivateTxs[i].Recv)
+		mimc.Write(circuit.PrivateTxs[i].Amt)
+		mimc.Write(circuit.PrivateTxs[i].Tx_salt)
+		api.AssertIsEqual(circuit.PrivateHash[i], mimc.Sum())
+	}
 
-	for i := 0; i < PrivateVecLength; i++ {
-		current_addr := circuit.PrivateDst[i]
+	// Then, for each recv address, check that the sum of the amt to that address is less than the threshold
+	for i := 0; i < len(circuit.PrivateTxs); i++ {
+		current_addr := circuit.PrivateTxs[i].Recv
 		current_amount := frontend.Variable(0)
-		for j := 0; j < PrivateVecLength; j++ {
-			diff := api.Sub(current_addr, circuit.PrivateDst[j])
+		for j := 0; j < len(circuit.PrivateTxs); j++ {
+			diff := api.Sub(current_addr, circuit.PrivateTxs[j].Recv)
 			diff_is_zero := api.IsZero(diff)
-			current_amount = api.Add(current_amount, api.Mul(diff_is_zero, circuit.PrivateAmount[j]))
+			current_amount = api.Add(current_amount, api.Mul(diff_is_zero, circuit.PrivateTxs[j].Amt))
 		}
 		api.AssertIsLessOrEqual(current_amount, circuit.PublicThreshold)
 	}
 
 	// The following is for the polynomial evaluation
-	privateProd := PolyEvalInCircuit(api, circuit.PrivateDst, circuit.PublicR)
-	privateProd = api.Mul(privateProd, PolyEvalInCircuit(api, circuit.PrivateSrc, circuit.PublicR))
-	privateProd = api.Mul(privateProd, PolyEvalInCircuit(api, circuit.PrivateAmount, circuit.PublicR))
-	privateProd = api.Mul(privateProd, PolyEvalInCircuit(api, circuit.DummyVec, circuit.PublicR))
+	privateProd := PolyEvalInCircuit(api, circuit.PrivateHash, circuit.PublicR)
+	privateProd = api.Mul(privateProd, circuit.PrivateMask)
+	//privateProd = api.Mul(privateProd, PolyEvalInCircuit(api, circuit.DummyVec, circuit.PublicR))
 	api.AssertIsEqual(privateProd, circuit.PublicProd)
+
+	// Check commitment for the private hashes and the private mask w/ the salt
+	mimc, _ := mimc.NewMiMC(api)
+	for i := 0; i < len(circuit.PrivateHash); i++ {
+		mimc.Write(circuit.PrivateHash[i])
+	}
+	mimc.Write(circuit.PrivateMask)
+	mimc.Write(circuit.PrivateSalt)
+	api.AssertIsEqual(circuit.PublicCommitment, mimc.Sum())
 
 	return nil
 }
@@ -83,56 +138,79 @@ func randomFr() fr_bn254.Element {
 	return e
 }
 
-type Transaction struct {
-	src fr_bn254.Element
-	dst fr_bn254.Element
-	amt fr_bn254.Element
-}
-
-type ClientSubmissionToShuffler struct {
-	transactions [PrivateVecLength]Transaction
-	dummyVec     [DummyVecLength]fr_bn254.Element
-}
+//type ClientSubmissionToShuffler struct {
+//	PrivateVec [PrivateVecLength]fr_bn254.Element
+//	DummyVec   [DummyVecLength]fr_bn254.Element
+//}
 
 type ClientSubmissionToServer struct {
-	publicWitness *witness.Witness
+	publicWitness witness.Witness
 	publicProd    fr_bn254.Element
 	proof         groth16.Proof
 }
 
-func asb(asdf uint64, asd uint64) (uint64, uint64) {
-	return asdf, asd
-}
-
-func RandomTransferWithProof(publicRFr fr_bn254.Element, ccs *frontend.CompiledConstraintSystem, pk *groth16.ProvingKey) (ClientSubmissionToShuffler, ClientSubmissionToServer) {
-	// just create a private Vec
-	var privateSrcFr [PrivateVecLength]fr_bn254.Element
-	var privateSrc [PrivateVecLength]frontend.Variable
-	var privateDstFr [PrivateVecLength]fr_bn254.Element
-	var privateDstUInt [PrivateVecLength]uint64
-	var privateDst [PrivateVecLength]frontend.Variable
-	var privateAmountFr [PrivateVecLength]fr_bn254.Element
-	var privateAmount [PrivateVecLength]frontend.Variable
-	var privateAmountUInt [PrivateVecLength]uint64
-	var transactionVec [PrivateVecLength]Transaction
-
-	for i := 0; i < PrivateVecLength; i++ {
-		privateSrcFr[i] = randomFr()
-		privateSrc[i] = frontend.Variable(privateSrcFr[i])
-
-		privateDstUInt[i] = uint64(rand.Intn(1000))
-		privateDstFr[i] = fr_bn254.NewElement(privateDstUInt[i])
-		privateDst[i] = frontend.Variable(privateDstFr[i])
-
-		//privateAmountFr[i] = fr_bn254.NewElement(uint64(rand.Intn(300)))
-		privateAmountUInt[i] = uint64(200)
-		privateAmountFr[i] = fr_bn254.NewElement(privateAmountUInt[i])
-		privateAmount[i] = frontend.Variable(privateAmountFr[i])
-
-		transactionVec[i] = Transaction{privateSrcFr[i], privateDstFr[i], privateAmountFr[i]}
+func GenProof(privateTxs []PrivateTx, privateHash []fr_bn254.Element,
+	publicRFr fr_bn254.Element, mask fr_bn254.Element,
+	com fr_bn254.Element, salt fr_bn254.Element, ccs *constraint.ConstraintSystem, pk *groth16.ProvingKey) ClientSubmissionToServer {
+	//publicRFr := fr_bn254.NewElement(uint64(1))
+	//publicRFr := randomFr()
+	//publicR := frontend.Variable(publicRFr)
+	privateTxsVar := make([]PrivateTxVar, len(privateTxs))
+	privateHashVar := make([]frontend.Variable, len(privateHash))
+	for i := 0; i < len(privateTxs); i++ {
+		privateTxsVar[i].Send = frontend.Variable(privateTxs[i].Send)
+		privateTxsVar[i].Recv = frontend.Variable(privateTxs[i].Recv)
+		privateTxsVar[i].Amt = frontend.Variable(privateTxs[i].Amt)
+		privateTxsVar[i].Tx_salt = frontend.Variable(privateTxs[i].Tx_salt)
+		privateHashVar[i] = frontend.Variable(privateHash[i])
 	}
 
-	//sort.Slice(privateDstUInt[:], func(i, j int) bool { return privateDstUInt[i] < privateDstUInt[j] })
+	privateProdFr := PolyEval(privateHash[:], publicRFr)
+	var publicProdFr fr_bn254.Element
+	publicProdFr.Mul(&privateProdFr, &mask)
+
+	// witness definition
+	assignment := PerAddressCheckCircuit{
+		PrivateTxs:       privateTxsVar[:],
+		PrivateHash:      privateHashVar[:],
+		PublicThreshold:  frontend.Variable(fr_bn254.NewElement(uint64(PublicThreshold))),
+		PrivateMask:      frontend.Variable(mask),
+		PublicR:          frontend.Variable(publicRFr),
+		PublicProd:       frontend.Variable(publicProdFr),
+		PublicCommitment: frontend.Variable(com),
+		PrivateSalt:      frontend.Variable(salt),
+	}
+	witness, _ := frontend.NewWitness(&assignment, ecc.BN254.ScalarField())
+	//fmt.Println(witness)
+	publicWitness, _ := witness.Public()
+
+	// groth16: Prove & Verify
+	proof, _ := groth16.Prove(*ccs, *pk, witness)
+
+	submissionToServer := ClientSubmissionToServer{
+		publicWitness: publicWitness,
+		publicProd:    publicProdFr,
+		proof:         proof,
+	}
+
+	return submissionToServer
+}
+
+/*
+
+func SplitAndShareWithProof(secretVal uint64, publicRFr fr_bn254.Element, ccs *constraint.ConstraintSystem, pk *groth16.ProvingKey) (ClientSubmissionToShuffler, ClientSubmissionToServer) {
+	// just create a private Vec
+	var privateValFr = fr_bn254.NewElement(secretVal)
+	var privateVecFr [PrivateVecLength]fr_bn254.Element
+	var privateVec [PrivateVecLength]frontend.Variable
+	privateVecFr[0] = privateValFr
+	for i := 1; i < len(privateVecFr); i++ {
+		privateVecFr[i] = randomFr()
+		//privateVecFr[i] = fr_bn254.NewElement(uint64(0))
+		privateVec[i] = frontend.Variable(privateVecFr[i])
+		privateVecFr[0].Sub(&privateVecFr[0], &privateVecFr[i])
+	}
+	privateVec[0] = frontend.Variable(privateVecFr[0])
 
 	//cnt := privateVecFr[0]
 	//for i := 1; i < len(privateVecFr); i++ {
@@ -140,8 +218,6 @@ func RandomTransferWithProof(publicRFr fr_bn254.Element, ccs *frontend.CompiledC
 	//	}
 	//fmt.Printf("cnt: %v\n", cnt.Uint64())
 	//assert.Equal()
-	//fmt.Println("privateDstFr: ", privateDstUInt)
-	//fmt.Println("privateAmountFr: ", privateAmountUInt)
 
 	var dummyVecFr [DummyVecLength]fr_bn254.Element
 	var dummyVec [DummyVecLength]frontend.Variable
@@ -155,44 +231,36 @@ func RandomTransferWithProof(publicRFr fr_bn254.Element, ccs *frontend.CompiledC
 	//publicRFr := fr_bn254.NewElement(uint64(1))
 	//publicRFr := randomFr()
 	publicR := frontend.Variable(publicRFr)
-	privateDstProdFr := PolyEval(privateDstFr[:], publicRFr)
-	privateSrcProdFr := PolyEval(privateSrcFr[:], publicRFr)
-	privateAmountProdFr := PolyEval(privateAmountFr[:], publicRFr)
+	privateProdFr := PolyEval(privateVecFr[:], publicRFr)
 	dummyProdFr := PolyEval(dummyVecFr[:], publicRFr)
 	var publicProdFr fr_bn254.Element
-	publicProdFr.Mul(&privateDstProdFr, &dummyProdFr)
-	publicProdFr.Mul(&publicProdFr, &privateSrcProdFr)
-	publicProdFr.Mul(&publicProdFr, &privateAmountProdFr)
+	publicProdFr.Mul(&privateProdFr, &dummyProdFr)
 	publicProd := frontend.Variable(publicProdFr)
 
+	//convert dummyVecFr to Variable
+	var dummyVecVar [len(dummyVecFr)]frontend.Variable
+	for i := 0; i < len(dummyVecFr); i++ {
+		dummyVecVar[i] = frontend.Variable(dummyVecFr[i])
+	}
+
 	// witness definition
-	assignment := AddrSumCheckCircuit{
-		PrivateSrc:      privateSrc[:],
-		PrivateDst:      privateDst[:],
-		PrivateAmount:   privateAmount[:],
+	assignment := sumAndCmpCircuit{
+		PrivateVec:      privateVec[:],
 		PublicThreshold: frontend.Variable(fr_bn254.NewElement(uint64(PublicThreshold))),
-		DummyVec:        dummyVec[:],
+		DummyVec:        dummyVecVar[:],
 		PublicR:         publicR,
 		PublicProd:      publicProd,
 	}
-
-	//fmt.Printf("assignment: %v", assignment)
-
-	witness, witness_err := frontend.NewWitness(&assignment, ecc.BN254)
-	if witness_err != nil {
-		fmt.Printf("witness_err: %v\n", witness_err)
-	}
-	///fmt.Println("witness: ", witness)
-	//fmt.Printf("assignment: %v", assignment)
+	witness, _ := frontend.NewWitness(&assignment, ecc.BN254.ScalarField())
+	//fmt.Println(witness)
 	publicWitness, _ := witness.Public()
-	//panic("pass")
 
 	// groth16: Prove & Verify
 	proof, _ := groth16.Prove(*ccs, *pk, witness)
 
 	submissionToShuffler := ClientSubmissionToShuffler{
-		transactions: transactionVec,
-		dummyVec:     dummyVecFr,
+		privateVec: privateVecFr,
+		dummyVec:   dummyVecFr,
 	}
 
 	submissionToServer := ClientSubmissionToServer{
@@ -203,8 +271,11 @@ func RandomTransferWithProof(publicRFr fr_bn254.Element, ccs *frontend.CompiledC
 
 	return submissionToShuffler, submissionToServer
 }
+*/
 
 func main() {
+	DummyVecLength = ComputeDummyNum(80, ClientNum, CorruptedNum)
+	log.Printf("lambda %v, n %v, t %v, Dummy Num: %v\n", 80, ClientNum, CorruptedNum, DummyVecLength)
 	/*
 		var a, b fr_bn254.Element
 		a.SetInt64(1)
@@ -215,70 +286,154 @@ func main() {
 		fmt.Printf("c: %v\n", c)
 		return
 	*/
-
-	// the server is defining the circuit
-
-	var privateDst [PrivateVecLength]frontend.Variable
-	var privateSrc [PrivateVecLength]frontend.Variable
-	var privateAmount [PrivateVecLength]frontend.Variable
-	var dummyVec [DummyVecLength]frontend.Variable
-	for i := 0; i < PrivateVecLength; i++ {
-		privateSrc[i] = frontend.Variable(fr_bn254.NewElement(uint64(0)))
-		privateDst[i] = frontend.Variable(fr_bn254.NewElement(uint64(0)))
-		privateAmount[i] = frontend.Variable(fr_bn254.NewElement(uint64(0)))
-	}
-	for i := 0; i < len(dummyVec); i++ {
-		dummyVec[i] = frontend.Variable(fr_bn254.NewElement(uint64(0)))
-	}
+	//for i := 0; i < len(dummyVec); i++ {
+	//	dummyVec[i] = frontend.Variable(fr_bn254.NewElement(uint64(0)))
+	//	}
 	//for i := 0; i < len(array); i++ {
 	//	array[i] = frontend.Variable(fr_bn254.NewElement(uint64(i)))
 	//	}
 
 	//array := [...]frontend.Variable{1, 2, 3, 4, 5}
-	var circuit = AddrSumCheckCircuit{
-		PrivateSrc:      privateSrc[:],
-		PrivateDst:      privateDst[:],
-		PrivateAmount:   privateAmount[:],
-		PublicThreshold: 0,
-		DummyVec:        dummyVec[:],
-		PublicR:         0,
-		PublicProd:      0,
+
+	//initialize a dummy circuit
+
+	dummyPrivateTxsVar := make([]PrivateTxVar, PrivateTxNum)
+	dummyPrivateHashVar := make([]frontend.Variable, PrivateTxNum)
+
+	for i := 0; i < PrivateTxNum; i++ {
+		dummyPrivateTxsVar[i] = PrivateTxVar{
+			Send:    frontend.Variable(0),
+			Recv:    frontend.Variable(0),
+			Amt:     frontend.Variable(0),
+			Tx_salt: frontend.Variable(0),
+		}
+		dummyPrivateHashVar[i] = frontend.Variable(0)
 	}
+
+	var circuit = PerAddressCheckCircuit{
+		PrivateTxs:       dummyPrivateTxsVar[:],
+		PrivateHash:      dummyPrivateHashVar[:],
+		PublicThreshold:  0,
+		PrivateMask:      0,
+		PublicR:          0,
+		PublicProd:       0,
+		PublicCommitment: 0,
+		PrivateSalt:      0,
+	}
+
 	//ccs, _ := frontend.Compile(ecc.BN254.ScalarField(), r1cs.NewBuilder, &circuit)
-	start := time.Now()
-	ccs, _ := frontend.Compile(ecc.BN254, r1cs.NewBuilder, &circuit)
+	ccs, _ := frontend.Compile(ecc.BN254.ScalarField(), r1cs.NewBuilder, &circuit)
 
 	// groth16 zkSNARK: Setup
 	pk, vk, _ := groth16.Setup(ccs)
-	setup_time := time.Since(start)
 
-	start = time.Now()
-	publicRFr := randomFr()
 	//publicRFr := fr_bn254.NewElement(uint64(1))
 
-	// for clients, each client has a private value
-	var allSecretVal []fr_bn254.Element
-	var allDummyVal []fr_bn254.Element
-	var allProof []ClientSubmissionToServer
+	source := rand.NewSource(time.Now().UnixNano())
+	rng := rand.New(source)
+
+	allPrivateTxs := make([][]PrivateTx, ClientNum)
+	allPrivateHash := make([][]fr_bn254.Element, ClientNum)
+	privateMask := make([]fr_bn254.Element, ClientNum)
+	splittedSecretMask := make([][]fr_bn254.Element, ClientNum)
+	privateSalt := make([]fr_bn254.Element, ClientNum)
+	commitment := make([]fr_bn254.Element, ClientNum)
+
+	shuffledHash := make([]fr_bn254.Element, ClientNum*PrivateTxNum)
+	shuffledMask := make([]fr_bn254.Element, ClientNum*DummyVecLength)
+
+	for i := 0; i < ClientNum; i++ {
+		allPrivateTxs[i] = make([]PrivateTx, PrivateTxNum)
+		allPrivateHash[i] = make([]fr_bn254.Element, PrivateTxNum)
+		for j := 0; j < PrivateTxNum; j++ {
+			send := i
+			recv := rng.Intn(ClientNum)
+			amt := rng.Intn(100)
+
+			allPrivateTxs[i][j].Send = fr_bn254.NewElement(uint64(send))
+			allPrivateTxs[i][j].Recv = fr_bn254.NewElement(uint64(recv))
+			allPrivateTxs[i][j].Amt = fr_bn254.NewElement(uint64(amt))
+			allPrivateTxs[i][j].Tx_salt = randomFr()
+			// mimc hash and store the hash
+			goMimc := hash.MIMC_BN254.New()
+			tmpBytes := allPrivateTxs[i][j].Send.Bytes()
+			goMimc.Write(tmpBytes[:])
+			tmpBytes = allPrivateTxs[i][j].Recv.Bytes()
+			goMimc.Write(tmpBytes[:])
+			tmpBytes = allPrivateTxs[i][j].Amt.Bytes()
+			goMimc.Write(tmpBytes[:])
+			tmpBytes = allPrivateTxs[i][j].Tx_salt.Bytes()
+			goMimc.Write(tmpBytes[:])
+			allPrivateHash[i][j].SetBytes(goMimc.Sum(nil))
+		}
+
+		privateMask[i] = fr_bn254.One()
+		splittedSecretMask[i] = make([]fr_bn254.Element, DummyVecLength)
+		for j := 0; j < len(splittedSecretMask[i]); j++ {
+			splittedSecretMask[i][j] = randomFr()
+			privateMask[i].Mul(&privateMask[i], &splittedSecretMask[i][j])
+		}
+
+		// compute the commitment
+		privateSalt[i] = randomFr()
+		goMimc := hash.MIMC_BN254.New()
+		for j := 0; j < len(allPrivateHash[i]); j++ {
+			b := allPrivateHash[i][j].Bytes()
+			goMimc.Write(b[:])
+		}
+		b := privateMask[i].Bytes()
+		goMimc.Write(b[:])
+		b = privateSalt[i].Bytes()
+		goMimc.Write(b[:])
+		commitment[i].SetBytes(goMimc.Sum(nil))
+
+		// append the private hash and the private mask to the shuffled hash and shuffled mask
+		for j := 0; j < len(allPrivateHash[i]); j++ {
+			shuffledHash[i*PrivateTxNum+j] = allPrivateHash[i][j]
+		}
+		for j := 0; j < len(splittedSecretMask[i]); j++ {
+			shuffledMask[i*int(DummyVecLength)+j] = splittedSecretMask[i][j]
+		}
+	}
+
+	//shuffle the shuffledHash and shuffledMask
+	rand.Shuffle(len(shuffledHash), func(i, j int) {
+		shuffledHash[i], shuffledHash[j] = shuffledHash[j], shuffledHash[i]
+	})
+	rand.Shuffle(len(shuffledMask), func(i, j int) {
+		shuffledMask[i], shuffledMask[j] = shuffledMask[j], shuffledMask[i]
+	})
+
+	// now the server can see the shuffled hash and shuffled mask
+
+	// Step 2:
+	// The server generates a public challenge and broadcasts it to all the clients.
+	publicRFr := randomFr()
+
+	// Step 3:
+	// Each client computes the public witness and the public product and sends them to the server.
+
+	start := time.Now()
+
+	allProof := make([]ClientSubmissionToServer, ClientNum)
 
 	// this counted as proving time
 	for i := 0; i < ClientNum; i++ {
-		//var secretVal uint64
-		toShuffler, toServer := RandomTransferWithProof(publicRFr, &ccs, &pk)
-		for j := 0; j < PrivateVecLength; j++ {
-			allSecretVal = append(allSecretVal, toShuffler.transactions[j].src, toShuffler.transactions[j].dst, toShuffler.transactions[j].amt)
-		}
+		//toShuffler, toServer := SplitAndShareWithProof(uint64(secretVal), publicRFr, &ccs, &pk)
+		toServer := GenProof(allPrivateTxs[i], allPrivateHash[i], publicRFr, privateMask[i], commitment[i], privateSalt[i], &ccs, &pk)
 		//allSecretVal = append(allSecretVal, toShuffler.privateVec[:]...)
-		allDummyVal = append(allDummyVal, toShuffler.dummyVec[:]...)
-		allProof = append(allProof, toServer)
+		//allDummyVal = append(allDummyVal, toShuffler.dummyVec[:]...)
+		allProof[i] = toServer
 	}
 
 	proving_time := time.Since(start)
 	start = time.Now()
 
-	//the server now sees all the secret values and dummy values
-	// it first verifies all the proof
-	// it also computes the product of all the publicProd
+	// Step 4:
+	// The server now sees all the secret values and dummy values.
+	// It first verifies all the proof
+	// It also computes the product of all the publicProd
+
 	prodFromClients := fr_bn254.NewElement(uint64(1))
 	for i := 0; i < ClientNum; i++ {
 		//verify proof
@@ -290,10 +445,12 @@ func main() {
 		prodFromClients.Mul(&prodFromClients, &allProof[i].publicProd)
 	}
 
-	// it then computes the product from shufflers
-	prodFromShuffler := PolyEval(allSecretVal, publicRFr)
-	dummyProdFromShuffler := PolyEval(allDummyVal, publicRFr)
-	prodFromShuffler.Mul(&prodFromShuffler, &dummyProdFromShuffler)
+	// It then computes the product from shufflers
+	prodFromShuffler := PolyEval(shuffledHash, publicRFr)
+	for i := 0; i < len(shuffledMask); i++ {
+		prodFromShuffler.Mul(&prodFromShuffler, &shuffledMask[i])
+	}
+	//prodFromShuffler.Mul(&prodFromShuffler, &dummyProdFromShuffler)
 	if prodFromShuffler.Equal(&prodFromClients) {
 		fmt.Printf("server: the set from clients is the same as the set from shuffler\n")
 	} else {
@@ -302,8 +459,8 @@ func main() {
 
 	verifying_time := time.Since(start)
 
-	// the server then computes the sum of all the secret values
 	/*
+		// the server then computes the sum of all the secret values
 		sum := fr_bn254.NewElement(uint64(0))
 		for i := 0; i < len(allSecretVal); i++ {
 			sum.Add(&sum, &allSecretVal[i])
@@ -311,9 +468,8 @@ func main() {
 		fmt.Printf("The computed sum is %v\n", sum.Uint64())
 	*/
 
-	log.Printf("setup time: %v\n", setup_time)
 	log.Printf("proving time: %v\n", proving_time)
-	log.Printf("Per client proving time: %v\n", proving_time/ClientNum)
+	log.Printf("Per client proving time: %v\n", proving_time/time.Duration(ClientNum))
 	log.Printf("verifying time: %v\n", verifying_time)
 
 	/*
