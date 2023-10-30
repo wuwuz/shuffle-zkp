@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"math"
@@ -11,20 +12,28 @@ import (
 	fr_bn254 "github.com/consensys/gnark-crypto/ecc/bn254/fr"
 	"github.com/consensys/gnark-crypto/hash"
 	"github.com/consensys/gnark/backend/groth16"
+	"github.com/consensys/gnark/backend/plonk"
 	"github.com/consensys/gnark/backend/witness"
 	"github.com/consensys/gnark/constraint"
 	"github.com/consensys/gnark/frontend"
 	"github.com/consensys/gnark/frontend/cs/r1cs"
+	"github.com/consensys/gnark/frontend/cs/scs"
 	"github.com/consensys/gnark/std/hash/mimc"
+	"github.com/consensys/gnark/test"
+
+	cs "github.com/consensys/gnark/constraint/bn254"
 )
 
 const (
 	// 5 private inputs
-	PrivateTxNum    = 20
-	PublicThreshold = 2000
-	ClientNum       = 100
-	CorruptedNum    = 0
+	PrivateTxNum    = 200
+	PublicThreshold = 10000
+	MaxNumOfCheckProof = 10
+	ClientNum       = 1000
+	CorruptedNum    = 500
 	e               = 2.71828182845904523536028747135266249775724709369995
+	BN254Size       = 32
+	CommitmentSize  = 32
 )
 
 var DummyVecLength uint64
@@ -144,14 +153,21 @@ func randomFr() fr_bn254.Element {
 //}
 
 type ClientSubmissionToServer struct {
-	publicWitness witness.Witness
+	publicWitness *witness.Witness
 	publicProd    fr_bn254.Element
-	proof         groth16.Proof
+	proof         *groth16.Proof
 }
 
-func GenProof(privateTxs []PrivateTx, privateHash []fr_bn254.Element,
+type ClientSubmissionToServerPlonk struct {
+	publicWitness *witness.Witness
+	publicProd    fr_bn254.Element
+	proof         *plonk.Proof
+}
+
+func GenProofGroth16(privateTxs []PrivateTx, privateHash []fr_bn254.Element,
 	publicRFr fr_bn254.Element, mask fr_bn254.Element,
-	com fr_bn254.Element, salt fr_bn254.Element, ccs *constraint.ConstraintSystem, pk *groth16.ProvingKey) ClientSubmissionToServer {
+	com fr_bn254.Element, salt fr_bn254.Element, ccs *constraint.ConstraintSystem, pk *groth16.ProvingKey,
+	realProof bool) ClientSubmissionToServer {
 	//publicRFr := fr_bn254.NewElement(uint64(1))
 	//publicRFr := randomFr()
 	//publicR := frontend.Variable(publicRFr)
@@ -180,21 +196,84 @@ func GenProof(privateTxs []PrivateTx, privateHash []fr_bn254.Element,
 		PublicCommitment: frontend.Variable(com),
 		PrivateSalt:      frontend.Variable(salt),
 	}
-	witness, _ := frontend.NewWitness(&assignment, ecc.BN254.ScalarField())
-	//fmt.Println(witness)
-	publicWitness, _ := witness.Public()
 
-	// groth16: Prove & Verify
-	proof, _ := groth16.Prove(*ccs, *pk, witness)
+	if realProof {
+		witness, _ := frontend.NewWitness(&assignment, ecc.BN254.ScalarField())
+		//fmt.Println(witness)
+		publicWitness, _ := witness.Public()
 
-	submissionToServer := ClientSubmissionToServer{
-		publicWitness: publicWitness,
-		publicProd:    publicProdFr,
-		proof:         proof,
+		// groth16: Prove & Verify
+		proof, _ := groth16.Prove(*ccs, *pk, witness)
+
+		return ClientSubmissionToServer{
+			publicWitness: &publicWitness,
+			publicProd:    publicProdFr,
+			proof:         &proof,
+		}
+	} else {
+		return ClientSubmissionToServer{
+			publicWitness: nil,
+			publicProd:    publicProdFr,
+			proof:         nil,
+		}
+	}
+}
+
+func GenProofPlonk(privateTxs []PrivateTx, privateHash []fr_bn254.Element,
+	publicRFr fr_bn254.Element, mask fr_bn254.Element,
+	com fr_bn254.Element, salt fr_bn254.Element, ccs *constraint.ConstraintSystem, pk *plonk.ProvingKey,
+	realProof bool) ClientSubmissionToServerPlonk {
+	//publicRFr := fr_bn254.NewElement(uint64(1))
+	//publicRFr := randomFr()
+	//publicR := frontend.Variable(publicRFr)
+	privateTxsVar := make([]PrivateTxVar, len(privateTxs))
+	privateHashVar := make([]frontend.Variable, len(privateHash))
+	for i := 0; i < len(privateTxs); i++ {
+		privateTxsVar[i].Send = frontend.Variable(privateTxs[i].Send)
+		privateTxsVar[i].Recv = frontend.Variable(privateTxs[i].Recv)
+		privateTxsVar[i].Amt = frontend.Variable(privateTxs[i].Amt)
+		privateTxsVar[i].Tx_salt = frontend.Variable(privateTxs[i].Tx_salt)
+		privateHashVar[i] = frontend.Variable(privateHash[i])
 	}
 
-	return submissionToServer
+	privateProdFr := PolyEval(privateHash[:], publicRFr)
+	var publicProdFr fr_bn254.Element
+	publicProdFr.Mul(&privateProdFr, &mask)
+
+	// witness definition
+	assignment := PerAddressCheckCircuit{
+		PrivateTxs:       privateTxsVar[:],
+		PrivateHash:      privateHashVar[:],
+		PublicThreshold:  frontend.Variable(fr_bn254.NewElement(uint64(PublicThreshold))),
+		PrivateMask:      frontend.Variable(mask),
+		PublicR:          frontend.Variable(publicRFr),
+		PublicProd:       frontend.Variable(publicProdFr),
+		PublicCommitment: frontend.Variable(com),
+		PrivateSalt:      frontend.Variable(salt),
+	}
+
+	if realProof {
+		witness, _ := frontend.NewWitness(&assignment, ecc.BN254.ScalarField())
+		//fmt.Println(witness)
+		publicWitness, _ := witness.Public()
+
+		// groth16: Prove & Verify
+		proof, _ := plonk.Prove(*ccs, *pk, witness)
+
+		return ClientSubmissionToServerPlonk{
+			publicWitness: &publicWitness,
+			publicProd:    publicProdFr,
+			proof:         &proof,
+		}
+	} else {
+		return ClientSubmissionToServerPlonk{
+			publicWitness: nil,
+			publicProd:    publicProdFr,
+			proof:         nil,
+		}
+	}
 }
+
 
 /*
 
@@ -273,27 +352,10 @@ func SplitAndShareWithProof(secretVal uint64, publicRFr fr_bn254.Element, ccs *c
 }
 */
 
-func main() {
+func ShuffleZKGroth16() {
 	DummyVecLength = ComputeDummyNum(80, ClientNum, CorruptedNum)
 	log.Printf("lambda %v, n %v, t %v, Dummy Num: %v\n", 80, ClientNum, CorruptedNum, DummyVecLength)
-	/*
-		var a, b fr_bn254.Element
-		a.SetInt64(1)
-		b.SetInt64(1)
-		a.Add(&a, &b)
-		fmt.Printf("a: %v\n", a)
-		c := a.Uint64()
-		fmt.Printf("c: %v\n", c)
-		return
-	*/
-	//for i := 0; i < len(dummyVec); i++ {
-	//	dummyVec[i] = frontend.Variable(fr_bn254.NewElement(uint64(0)))
-	//	}
-	//for i := 0; i < len(array); i++ {
-	//	array[i] = frontend.Variable(fr_bn254.NewElement(uint64(i)))
-	//	}
-
-	//array := [...]frontend.Variable{1, 2, 3, 4, 5}
+	dummyCostPerClient := DummyVecLength * BN254Size
 
 	//initialize a dummy circuit
 
@@ -326,6 +388,12 @@ func main() {
 
 	// groth16 zkSNARK: Setup
 	pk, vk, _ := groth16.Setup(ccs)
+	var buf bytes.Buffer
+	pk.WriteTo(&buf)
+	// check how many bytes are written
+	provingKeySize := buf.Len()
+	// clean the buffer
+	buf.Reset()
 
 	//publicRFr := fr_bn254.NewElement(uint64(1))
 
@@ -419,14 +487,31 @@ func main() {
 
 	// this counted as proving time
 	for i := 0; i < ClientNum; i++ {
+		realProof := false
+		if i < MaxNumOfCheckProof {
+			realProof = true
+		}
 		//toShuffler, toServer := SplitAndShareWithProof(uint64(secretVal), publicRFr, &ccs, &pk)
-		toServer := GenProof(allPrivateTxs[i], allPrivateHash[i], publicRFr, privateMask[i], commitment[i], privateSalt[i], &ccs, &pk)
+		toServer := GenProofGroth16(allPrivateTxs[i], allPrivateHash[i], publicRFr, privateMask[i], commitment[i], privateSalt[i], &ccs, &pk, realProof)
 		//allSecretVal = append(allSecretVal, toShuffler.privateVec[:]...)
 		//allDummyVal = append(allDummyVal, toShuffler.dummyVec[:]...)
 		allProof[i] = toServer
 	}
-
 	proving_time := time.Since(start)
+
+
+	(*(allProof[0].proof)).WriteTo(&buf)
+	// check how many bytes are written
+	proofSize := buf.Len()
+	// clean the buffer
+	buf.Reset()
+
+	(*(allProof[0].publicWitness)).WriteTo(&buf)
+	// check how many bytes are written
+	publicWitnessSize := buf.Len()
+	// clean the buffer
+	buf.Reset()
+
 	start = time.Now()
 
 	// Step 4:
@@ -438,12 +523,18 @@ func main() {
 	for i := 0; i < ClientNum; i++ {
 		//verify proof
 		//fmt.Printf("proof: %v
-		verification_err := groth16.Verify(allProof[i].proof, vk, allProof[i].publicWitness)
-		if verification_err != nil {
-			fmt.Printf("verification error in client %v", i)
+		if i < MaxNumOfCheckProof {
+			verification_err := groth16.Verify(*allProof[i].proof, vk, *allProof[i].publicWitness)
+			if verification_err != nil {
+				fmt.Printf("verification error in client %v", i)
+			}
 		}
 		prodFromClients.Mul(&prodFromClients, &allProof[i].publicProd)
 	}
+
+	verifying_time_only_proof := time.Since(start)
+
+	start = time.Now()
 
 	// It then computes the product from shufflers
 	prodFromShuffler := PolyEval(shuffledHash, publicRFr)
@@ -459,88 +550,239 @@ func main() {
 
 	verifying_time := time.Since(start)
 
-	/*
-		// the server then computes the sum of all the secret values
-		sum := fr_bn254.NewElement(uint64(0))
-		for i := 0; i < len(allSecretVal); i++ {
-			sum.Add(&sum, &allSecretVal[i])
-		}
-		fmt.Printf("The computed sum is %v\n", sum.Uint64())
-	*/
-
+	log.Printf("Task: AML; Proof System: Groth16")
 	log.Printf("proving time: %v\n", proving_time)
-	log.Printf("Per client proving time: %v\n", proving_time/time.Duration(ClientNum))
-	log.Printf("verifying time: %v\n", verifying_time)
+	log.Printf("Per client proving time: %v\n", proving_time/time.Duration(MaxNumOfCheckProof))
+	log.Printf("total verifying time (only verifying %v proofs): %v\n", MaxNumOfCheckProof, verifying_time_only_proof + verifying_time)
+	log.Printf("Per client verifying time: %v\n", verifying_time/time.Duration(ClientNum) + verifying_time_only_proof/time.Duration(MaxNumOfCheckProof))
 
-	/*
-		// just create a private Vec
+	log.Printf("Client Storage/Communication Cost (bytes):")
+	log.Printf("Proving Key %v\n", provingKeySize)
+	log.Printf("To Shuffler %v\n", dummyCostPerClient)
+	log.Printf("To Server %v\n", proofSize+publicWitnessSize+CommitmentSize+BN254Size) // a commitment, a public prod, a proof, a public witness
+}
 
-		var privateValFr = fr_bn254.NewElement(uint64(14))
-		var privateVecFr [5]fr_bn254.Element
-		var privateVec [5]frontend.Variable
-		privateVecFr[0] = privateValFr
-		for i := 1; i < len(privateVecFr); i++ {
-			privateVecFr[i] = randomFr()
-			privateVec[i] = frontend.Variable(privateVecFr[i])
-			privateVecFr[0].Sub(&privateVecFr[0], &privateVecFr[i])
+func ShuffleZKPlonk() {
+	DummyVecLength = ComputeDummyNum(80, ClientNum, CorruptedNum)
+	log.Printf("lambda %v, n %v, t %v, Dummy Num: %v\n", 80, ClientNum, CorruptedNum, DummyVecLength)
+	dummyCostPerClient := DummyVecLength * BN254Size
+
+	//initialize a dummy circuit
+
+	dummyPrivateTxsVar := make([]PrivateTxVar, PrivateTxNum)
+	dummyPrivateHashVar := make([]frontend.Variable, PrivateTxNum)
+
+	for i := 0; i < PrivateTxNum; i++ {
+		dummyPrivateTxsVar[i] = PrivateTxVar{
+			Send:    frontend.Variable(0),
+			Recv:    frontend.Variable(0),
+			Amt:     frontend.Variable(0),
+			Tx_salt: frontend.Variable(0),
 		}
-		privateVec[0] = frontend.Variable(privateVecFr[0])
+		dummyPrivateHashVar[i] = frontend.Variable(0)
+	}
 
-		cnt := privateVecFr[0]
-		for i := 1; i < len(privateVecFr); i++ {
-			cnt.Add(&cnt, &privateVecFr[i])
+	var circuit = PerAddressCheckCircuit{
+		PrivateTxs:       dummyPrivateTxsVar[:],
+		PrivateHash:      dummyPrivateHashVar[:],
+		PublicThreshold:  0,
+		PrivateMask:      0,
+		PublicR:          0,
+		PublicProd:       0,
+		PublicCommitment: 0,
+		PrivateSalt:      0,
+	}
+
+	//ccs, _ := frontend.Compile(ecc.BN254.ScalarField(), r1cs.NewBuilder, &circuit)
+	ccs, err := frontend.Compile(ecc.BN254.ScalarField(), scs.NewBuilder, &circuit)
+	if err != nil {
+		log.Println("scs circuit compile error")
+	}
+
+	//setup kzg
+	_r1cs := ccs.(*cs.SparseR1CS)
+	srs, err := test.NewKZGSRS(_r1cs)
+	if err != nil {
+		log.Println("kzg srs error")
+	}
+
+	// plonk zkSNARK: Setup
+	pk, vk, _ := plonk.Setup(ccs, srs)
+	var buf bytes.Buffer
+	pk.WriteTo(&buf)
+	// check how many bytes are written
+	provingKeySize := buf.Len()
+	// clean the buffer
+	buf.Reset()
+
+	//publicRFr := fr_bn254.NewElement(uint64(1))
+
+	source := rand.NewSource(time.Now().UnixNano())
+	rng := rand.New(source)
+
+	allPrivateTxs := make([][]PrivateTx, ClientNum)
+	allPrivateHash := make([][]fr_bn254.Element, ClientNum)
+	privateMask := make([]fr_bn254.Element, ClientNum)
+	splittedSecretMask := make([][]fr_bn254.Element, ClientNum)
+	privateSalt := make([]fr_bn254.Element, ClientNum)
+	commitment := make([]fr_bn254.Element, ClientNum)
+
+	shuffledHash := make([]fr_bn254.Element, ClientNum*PrivateTxNum)
+	shuffledMask := make([]fr_bn254.Element, ClientNum*DummyVecLength)
+
+	for i := 0; i < ClientNum; i++ {
+		allPrivateTxs[i] = make([]PrivateTx, PrivateTxNum)
+		allPrivateHash[i] = make([]fr_bn254.Element, PrivateTxNum)
+		for j := 0; j < PrivateTxNum; j++ {
+			send := i
+			recv := rng.Intn(ClientNum)
+			amt := rng.Intn(100)
+
+			allPrivateTxs[i][j].Send = fr_bn254.NewElement(uint64(send))
+			allPrivateTxs[i][j].Recv = fr_bn254.NewElement(uint64(recv))
+			allPrivateTxs[i][j].Amt = fr_bn254.NewElement(uint64(amt))
+			allPrivateTxs[i][j].Tx_salt = randomFr()
+			// mimc hash and store the hash
+			goMimc := hash.MIMC_BN254.New()
+			tmpBytes := allPrivateTxs[i][j].Send.Bytes()
+			goMimc.Write(tmpBytes[:])
+			tmpBytes = allPrivateTxs[i][j].Recv.Bytes()
+			goMimc.Write(tmpBytes[:])
+			tmpBytes = allPrivateTxs[i][j].Amt.Bytes()
+			goMimc.Write(tmpBytes[:])
+			tmpBytes = allPrivateTxs[i][j].Tx_salt.Bytes()
+			goMimc.Write(tmpBytes[:])
+			allPrivateHash[i][j].SetBytes(goMimc.Sum(nil))
 		}
-		fmt.Printf("cnt: %v\n", cnt.Uint64())
 
-		var dummyVecFr [2]fr_bn254.Element
-		var dummyVec [2]frontend.Variable
-		for i := 0; i < len(dummyVecFr); i++ {
-			dummyVecFr[i].SetUint64(uint64(i * 10))
-			dummyVec[i] = frontend.Variable(dummyVecFr[i])
+		privateMask[i] = fr_bn254.One()
+		splittedSecretMask[i] = make([]fr_bn254.Element, DummyVecLength)
+		for j := 0; j < len(splittedSecretMask[i]); j++ {
+			splittedSecretMask[i][j] = randomFr()
+			privateMask[i].Mul(&privateMask[i], &splittedSecretMask[i][j])
 		}
 
-		//publicRFr := fr_bn254.NewElement(uint64(1))
-		publicRFr := randomFr()
-		publicR := frontend.Variable(publicRFr)
-		privateProdFr := PolyEval(privateVecFr[:], publicRFr)
-		dummyProdFr := PolyEval(dummyVecFr[:], publicRFr)
-		var publicProdFr fr_bn254.Element
-		publicProdFr.Mul(&privateProdFr, &dummyProdFr)
-		publicProd := frontend.Variable(publicProdFr)
-
-		//convert dummyVecFr to Variable
-		var dummyVecVar [len(dummyVecFr)]frontend.Variable
-		for i := 0; i < len(dummyVecFr); i++ {
-			dummyVecVar[i] = frontend.Variable(dummyVecFr[i])
+		// compute the commitment
+		privateSalt[i] = randomFr()
+		goMimc := hash.MIMC_BN254.New()
+		for j := 0; j < len(allPrivateHash[i]); j++ {
+			b := allPrivateHash[i][j].Bytes()
+			goMimc.Write(b[:])
 		}
+		b := privateMask[i].Bytes()
+		goMimc.Write(b[:])
+		b = privateSalt[i].Bytes()
+		goMimc.Write(b[:])
+		commitment[i].SetBytes(goMimc.Sum(nil))
 
-		//convert privateVecFr to Variable
-		var privateVecVar [5]frontend.Variable
-		for i := 0; i < len(privateVecFr); i++ {
-			privateVecVar[i] = frontend.Variable(privateVecFr[i])
+		// append the private hash and the private mask to the shuffled hash and shuffled mask
+		for j := 0; j < len(allPrivateHash[i]); j++ {
+			shuffledHash[i*PrivateTxNum+j] = allPrivateHash[i][j]
 		}
-
-		//TODO: add a random sample in Fr
-		//TODO: convert to Variable
-
-		// witness definition
-		assignment := sumAndCmpCircuit{
-			PrivateVec:      privateVecVar[:],
-			PublicThreshold: frontend.Variable(fr_bn254.NewElement(uint64(15))),
-			DummyVec:        dummyVecVar[:],
-			PublicR:         publicR,
-			PublicProd:      publicProd,
+		for j := 0; j < len(splittedSecretMask[i]); j++ {
+			shuffledMask[i*int(DummyVecLength)+j] = splittedSecretMask[i][j]
 		}
-		witness, _ := frontend.NewWitness(&assignment, ecc.BN254)
-		fmt.Println(witness)
-		publicWitness, _ := witness.Public()
+	}
 
-		// groth16: Prove & Verify
-		proof, proof_err := groth16.Prove(ccs, pk, witness)
-		fmt.Printf("proof error: %v\n", proof_err)
+	//shuffle the shuffledHash and shuffledMask
+	rand.Shuffle(len(shuffledHash), func(i, j int) {
+		shuffledHash[i], shuffledHash[j] = shuffledHash[j], shuffledHash[i]
+	})
+	rand.Shuffle(len(shuffledMask), func(i, j int) {
+		shuffledMask[i], shuffledMask[j] = shuffledMask[j], shuffledMask[i]
+	})
 
-		verification_err := groth16.Verify(proof, vk, publicWitness)
+	// now the server can see the shuffled hash and shuffled mask
 
-		fmt.Printf("verification error: %v\n", verification_err)
-	*/
+	// Step 2:
+	// The server generates a public challenge and broadcasts it to all the clients.
+	publicRFr := randomFr()
+
+	// Step 3:
+	// Each client computes the public witness and the public product and sends them to the server.
+
+	start := time.Now()
+
+	allProof := make([]ClientSubmissionToServerPlonk, ClientNum)
+
+	// this counted as proving time
+	for i := 0; i < ClientNum; i++ {
+		realProof := false
+		if i < MaxNumOfCheckProof {
+			realProof = true
+		}
+		//toShuffler, toServer := SplitAndShareWithProof(uint64(secretVal), publicRFr, &ccs, &pk)
+		toServer := GenProofPlonk(allPrivateTxs[i], allPrivateHash[i], publicRFr, privateMask[i], commitment[i], privateSalt[i], &ccs, &pk, realProof)
+		//allSecretVal = append(allSecretVal, toShuffler.privateVec[:]...)
+		//allDummyVal = append(allDummyVal, toShuffler.dummyVec[:]...)
+		allProof[i] = toServer
+	}
+	proving_time := time.Since(start)
+
+
+	(*(allProof[0].proof)).WriteTo(&buf)
+	// check how many bytes are written
+	proofSize := buf.Len()
+	// clean the buffer
+	buf.Reset()
+
+	(*(allProof[0].publicWitness)).WriteTo(&buf)
+	// check how many bytes are written
+	publicWitnessSize := buf.Len()
+	// clean the buffer
+	buf.Reset()
+
+	start = time.Now()
+
+	// Step 4:
+	// The server now sees all the secret values and dummy values.
+	// It first verifies all the proof
+	// It also computes the product of all the publicProd
+
+	prodFromClients := fr_bn254.NewElement(uint64(1))
+	for i := 0; i < ClientNum; i++ {
+		//verify proof
+		//fmt.Printf("proof: %v
+		if i < MaxNumOfCheckProof {
+			verification_err := plonk.Verify(*allProof[i].proof, vk, *allProof[i].publicWitness)
+			if verification_err != nil {
+				fmt.Printf("verification error in client %v", i)
+			}
+		}
+		prodFromClients.Mul(&prodFromClients, &allProof[i].publicProd)
+	}
+
+	verifying_time_only_proof := time.Since(start)
+
+	start = time.Now()
+
+	// It then computes the product from shufflers
+	prodFromShuffler := PolyEval(shuffledHash, publicRFr)
+	for i := 0; i < len(shuffledMask); i++ {
+		prodFromShuffler.Mul(&prodFromShuffler, &shuffledMask[i])
+	}
+	//prodFromShuffler.Mul(&prodFromShuffler, &dummyProdFromShuffler)
+	if prodFromShuffler.Equal(&prodFromClients) {
+		fmt.Printf("server: the set from clients is the same as the set from shuffler\n")
+	} else {
+		fmt.Printf("server: the set from clients is NOT the same as the set from shuffler\n")
+	}
+
+	verifying_time := time.Since(start)
+
+	log.Printf("Task: AML; Proof System: Plonk")
+	log.Printf("proving time: %v\n", proving_time)
+	log.Printf("Per client proving time: %v\n", proving_time/time.Duration(MaxNumOfCheckProof))
+	log.Printf("total verifying time (only verifying %v proofs): %v\n", MaxNumOfCheckProof, verifying_time_only_proof + verifying_time)
+	log.Printf("Per client verifying time: %v\n", verifying_time/time.Duration(ClientNum) + verifying_time_only_proof/time.Duration(MaxNumOfCheckProof))
+
+	log.Printf("Client Storage/Communication Cost (bytes):")
+	log.Printf("Proving Key %v\n", provingKeySize)
+	log.Printf("To Shuffler %v\n", dummyCostPerClient)
+	log.Printf("To Server %v\n", proofSize+publicWitnessSize+CommitmentSize+BN254Size) // a commitment, a public prod, a proof, a public witness
+}
+
+func main() {
+	//ShuffleZKGroth16()
+	ShuffleZKPlonk()
 }
