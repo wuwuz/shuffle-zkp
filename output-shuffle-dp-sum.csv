@@ -1,0 +1,21 @@
+Shuffle-DP Sum Groth16, 500, 248.898713ms, 3.270045ms, 2.171875
+Shuffle-DP Sum Groth16, 500, 244.98258ms, 3.337354ms, 2.171875
+Shuffle-DP Sum Groth16, 500, 240.344114ms, 3.734134ms, 2.171875
+Shuffle-DP Sum Groth16, 500, 238.785338ms, 2.549481ms, 2.171875
+Shuffle-DP Sum Groth16, 500, 237.831455ms, 2.711945ms, 2.171875
+Shuffle-DP Sum Plonk, 500, 439.078296ms, 2.672968ms, 2.55078125
+Shuffle-DP Sum Plonk, 500, 435.475654ms, 2.741338ms, 2.55078125
+Shuffle-DP Sum Plonk, 500, 432.469199ms, 2.857509ms, 2.55078125
+Shuffle-DP Sum Plonk, 500, 438.137026ms, 2.652628ms, 2.55078125
+Shuffle-DP Sum Plonk, 500, 443.03098ms, 2.634626ms, 2.55078125
+Name, Honest Client Num, Client Time, Server Time, Communication Cost
+Shuffle-DP Sum Groth16, 500, 303.398566ms, 2.169512ms, 2.171875
+Shuffle-DP Sum Groth16, 500, 186.392701ms, 3.850069ms, 2.171875
+Shuffle-DP Sum Groth16, 500, 260.93783ms, 4.54176ms, 2.171875
+Shuffle-DP Sum Groth16, 500, 211.856028ms, 1.238267ms, 2.171875
+Shuffle-DP Sum Groth16, 500, 311.102994ms, 3.689588ms, 2.171875
+Shuffle-DP Sum Plonk, 500, 883.112484ms, 2.939786ms, 2.55078125
+Shuffle-DP Sum Plonk, 500, 973.03523ms, 3.619922ms, 2.55078125
+Shuffle-DP Sum Plonk, 500, 834.485917ms, 2.663339ms, 2.55078125
+Shuffle-DP Sum Plonk, 500, 649.611223ms, 2.865584ms, 2.55078125
+Shuffle-DP Sum Plonk, 500, 921.215949ms, 2.695226ms, 2.55078125

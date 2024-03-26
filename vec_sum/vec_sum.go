@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/rand"
 	"time"
+	"os"
 
 	"github.com/consensys/gnark-crypto/ecc"
 	fr_bn254 "github.com/consensys/gnark-crypto/ecc/bn254/fr"
@@ -37,8 +38,10 @@ const (
 	BN254Size       = 32
 	CommitmentSize  = 32
 	MaxNumOfCheckProof = 10
+	TestRepeat = 5
 )
 
+var file *os.File
 var DummyVecLength uint64
 
 func ComputeDummyNum(lambda uint64, n uint64, t uint64) uint64 {
@@ -114,7 +117,6 @@ func (circuit *sumAndCmpCircuit) Define(api frontend.API) error {
 	mimc.Write(circuit.PrivateMask)
 	mimc.Write(circuit.PrivateSalt)
 	api.AssertIsEqual(circuit.PublicCommitment, mimc.Sum())
-
 	return nil
 }
 
@@ -442,6 +444,8 @@ func ShuffleZKGroth16() {
 	// Also, it generates the mulitple masks and compute the product of the masks.
 	// It commits to those masks vals and those masks then sends the commitments to the server.
 
+	start := time.Now()
+
 	for i := 0; i < ClientNum; i++ {
 		// split the secret value
 		splittedSecretVal[i] = make([]fr_bn254.Element, PrivateShareNum * PrivateVecLength)
@@ -497,7 +501,7 @@ func ShuffleZKGroth16() {
 		allMask = append(allMask, splittedSecretMask[i][:]...)
 	}
 
-	log.Printf("hahahah")
+	prepTime := time.Since(start)
 
 	dummyCostPerClient := DummyVecLength * BN254Size
 
@@ -521,7 +525,7 @@ func ShuffleZKGroth16() {
 	// Step 3:
 	// Each client computes the public witness and the public product and sends them to the server.
 
-	start := time.Now()
+	start = time.Now()
 
 	// this counted as proving time
 	for i := 0; i < ClientNum; i++ {
@@ -613,6 +617,7 @@ func ShuffleZKGroth16() {
 
 	log.Printf("proving time: %v\n", proving_time)
 	log.Printf("Per client proving time: %v\n", proving_time/time.Duration(MaxNumOfCheckProof))
+	log.Printf("Per client compute time: %v\n", proving_time/time.Duration(MaxNumOfCheckProof) + prepTime/time.Duration(ClientNum))
 	//log.Printf("verifying time: %v\n", verifying_time)
 	log.Printf("Per client verifying time: %v\n", verifying_time_only_proof / time.Duration(MaxNumOfCheckProof) + verifying_time / time.Duration(ClientNum))
 
@@ -620,6 +625,13 @@ func ShuffleZKGroth16() {
 	log.Printf("Proving Key %v\n", provingKeySize)
 	log.Printf("To Shuffler %v\n", dummyCostPerClient)
 	log.Printf("To Server %v\n", proofSize+publicWitnessSize+CommitmentSize+BN254Size) // a commitment, a public prod, a proof, a public witness
+
+	clientTime := proving_time / time.Duration(MaxNumOfCheckProof) + prepTime/time.Duration(ClientNum)
+	amtServerTime := verifying_time/time.Duration(ClientNum) + verifying_time_only_proof/time.Duration(MaxNumOfCheckProof)
+	commCost := (float64(dummyCostPerClient) + float64(proofSize)+float64(publicWitnessSize)+float64(CommitmentSize)+float64(BN254Size) ) / 1024
+	//commCost := dummyCostPerClient + proofSize+publicWitnessSize+CommitmentSize+BN254Size
+
+	file.WriteString(fmt.Sprintf("Vec Sum Groth16, %v, %v, %v, %v\n", ClientNum - CorruptedNum, clientTime, amtServerTime, commCost))
 }
 
 
@@ -699,6 +711,8 @@ func ShuffleZKPlonk() {
 	// Also, it generates the mulitple masks and compute the product of the masks.
 	// It commits to those masks vals and those masks then sends the commitments to the server.
 
+	start := time.Now()
+
 	for i := 0; i < ClientNum; i++ {
 		// split the secret value
 		splittedSecretVal[i] = make([]fr_bn254.Element, PrivateShareNum * PrivateVecLength)
@@ -754,7 +768,7 @@ func ShuffleZKPlonk() {
 		allMask = append(allMask, splittedSecretMask[i][:]...)
 	}
 
-	log.Printf("hahahah")
+	prepTime := time.Since(start)
 
 	dummyCostPerClient := DummyVecLength * BN254Size
 
@@ -778,7 +792,7 @@ func ShuffleZKPlonk() {
 	// Step 3:
 	// Each client computes the public witness and the public product and sends them to the server.
 
-	start := time.Now()
+	start = time.Now()
 
 	// this counted as proving time
 	for i := 0; i < ClientNum; i++ {
@@ -872,6 +886,7 @@ func ShuffleZKPlonk() {
 
 	log.Printf("proving time: %v\n", proving_time)
 	log.Printf("Per client proving time: %v\n", proving_time/time.Duration(MaxNumOfCheckProof))
+	log.Printf("Per client compute time: %v\n", proving_time/time.Duration(MaxNumOfCheckProof) + prepTime/time.Duration(ClientNum))
 	//log.Printf("verifying time: %v\n", verifying_time)
 	log.Printf("Per client verifying time: %v\n", verifying_time_only_proof / time.Duration(MaxNumOfCheckProof) + verifying_time / time.Duration(ClientNum))
 
@@ -879,6 +894,13 @@ func ShuffleZKPlonk() {
 	log.Printf("Proving Key %v\n", provingKeySize)
 	log.Printf("To Shuffler %v\n", dummyCostPerClient)
 	log.Printf("To Server %v\n", proofSize+publicWitnessSize+CommitmentSize+BN254Size) // a commitment, a public prod, a proof, a public witness
+
+	clientTime := proving_time / time.Duration(MaxNumOfCheckProof) + prepTime/time.Duration(ClientNum)
+	amtServerTime := verifying_time/time.Duration(ClientNum) + verifying_time_only_proof/time.Duration(MaxNumOfCheckProof)
+	commCost := (float64(dummyCostPerClient) + float64(proofSize)+float64(publicWitnessSize)+float64(CommitmentSize)+float64(BN254Size) ) / 1024
+	//commCost := dummyCostPerClient + proofSize+publicWitnessSize+CommitmentSize+BN254Size
+
+	file.WriteString(fmt.Sprintf("Vec Sum Plonk, %v, %v, %v, %v\n", ClientNum - CorruptedNum, clientTime, amtServerTime, commCost))
 }
 
 
@@ -1096,6 +1118,24 @@ func ShuffleZKPlonk() {
 */
 
 func main() {
-	//ShuffleZKGroth16()
-	ShuffleZKPlonk()
+	var err error
+	file, err = os.OpenFile("output-vec-sum.csv", os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
+	if err != nil {
+		panic(err)
+	}
+
+	defer file.Close()
+
+	file.WriteString("Name, Honest Client Num, Client Time, Server Time, Communication Cost\n")
+
+
+	for t := 0; t < TestRepeat; t++ {
+		ShuffleZKGroth16()
+	}
+
+	for t := 0; t < TestRepeat; t++ {
+		ShuffleZKPlonk()
+	}
+
+	//ShuffleZKPlonk()
 }
