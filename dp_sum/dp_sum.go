@@ -22,25 +22,32 @@ import (
 	"github.com/consensys/gnark/std/hash/mimc"
 	"github.com/consensys/gnark/test"
 
+	//"gonum.org/v1/gonum/stat/sampleuv"
+
 	cs "github.com/consensys/gnark/constraint/bn254"
 )
 
 const (
-	// 5 private inputs
-	PrivateShareNum = 60
-	CandidateNum    = 10
-	//DummyVecLength   = 60
-	ClientNum          = 1000
-	CorruptedNum       = 500
-	e                  = 2.71828182845904523536028747135266249775724709369995
-	BN254Size          = 32
-	CommitmentSize     = 32
+	PrivateVecLength = 60
+	ClientNum        = 1000
+	CorruptedNum     = 500
+	e                = 2.71828182845904523536028747135266249775724709369995
+	BN254Size        = 32
+	CommitmentSize   = 32
+	eps              = 1.0
+
+	ClientValRange = 1000       // the client's value is between 0 and 1000
+	NoiseRange     = 500        // the noise is between -500 and 500
+	ConstShift     = NoiseRange // the value is shifted by NoiseRange to make sure it is positive
+
+	// How many actual proofs we want to check
 	MaxNumOfCheckProof = 10
-	TestRepeat         = 1
+	// How many repetitions we want to test
+	TestRepeat = 1
 )
 
-var file *os.File
 var DummyVecLength uint64
+var file *os.File
 
 func ComputeDummyNum(lambda uint64, n uint64, t uint64) uint64 {
 	tmp := float64(2*lambda+254)/float64(math.Log2(float64(n-t))-math.Log2(e)) + 2
@@ -66,15 +73,9 @@ func PolyEvalInCircuit(api frontend.API, vec []frontend.Variable, publicR fronte
 	return prod
 }
 
-type VoteCircuit struct {
-	//UnsortedCandidate []frontend.Variable `gnark:",public"`
-	// sorted candidate list. Should be a permutation of 0 - (CandidateNum - 1)
-	SortedCandidate []frontend.Variable
-
-	// (c * (c - 1) / 2) comparison pairs.
-	// A pair (Alice Bob) means Alice is ranked higher than Bob
-	PairFirstVar  []frontend.Variable
-	PairSecondVar []frontend.Variable
+type SumAndCmpCircuit struct {
+	PrivateVec      []frontend.Variable
+	PublicThreshold frontend.Variable `gnark:",public"`
 
 	// The following are for the polynomial evaluation
 	PrivateMask frontend.Variable
@@ -86,58 +87,30 @@ type VoteCircuit struct {
 	PrivateSalt      frontend.Variable
 }
 
-func (circuit *VoteCircuit) Define(api frontend.API) error {
-
-	// first verify that the unsorted candidate list is a permutation of 0 - (CandidateNum - 1)
-	unsortedCandidate := make([]frontend.Variable, CandidateNum)
-	for i := 0; i < CandidateNum; i++ {
-		//api.AssertIsEqual(circuit.UnsortedCandidate[i], frontend.Variable(i))
-		unsortedCandidate[i] = frontend.Variable(i)
+func (circuit *SumAndCmpCircuit) Define(api frontend.API) error {
+	// check 0 <= sum <= threshold
+	sum := frontend.Variable(0)
+	for i := 0; i < len(circuit.PrivateVec); i++ {
+		sum = api.Add(sum, circuit.PrivateVec[i])
 	}
-
-	// then verify that the sorted candidate list is a permutation of 0 - (CandidateNum - 1)
-	unsortedProd := PolyEvalInCircuit(api, unsortedCandidate, circuit.PublicR)
-	sortedProd := PolyEvalInCircuit(api, circuit.SortedCandidate, circuit.PublicR)
-	api.AssertIsEqual(unsortedProd, sortedProd)
-
-	// Then verify that the pairs are correct
-	// Essentially, there are (c * (c - 1) / 2) pairs
-	// It should be arranged in the following way:
-	// Let's say the rankings are [1, 0, 2, 3]
-	// Then there are 4 rows, and the pairs are:
-	// (1, 0), (1, 2), (1, 3)
-	// (0, 2), (0, 3)
-	// (2, 3)
-
-	processedVec := make([]frontend.Variable, len(circuit.PairFirstVar))
-	base := 0
-	for i := 0; i < CandidateNum; i++ {
-		for j := 0; j < CandidateNum-i-1; j++ {
-			// first verify the first element of the pair is sorted[i]
-			api.AssertIsEqual(circuit.PairFirstVar[base+j], circuit.SortedCandidate[i])
-
-			// then verify the second element of the pair is sorted[i+j+1]
-			api.AssertIsEqual(circuit.PairSecondVar[base+j], circuit.SortedCandidate[i+j+1])
-
-			// the processedVec should be first * CandidateNum + second
-			processedVec[base+j] = api.Add(api.Mul(circuit.PairFirstVar[base+j], frontend.Variable(CandidateNum)), circuit.PairSecondVar[base+j])
-		}
-		base += CandidateNum - i - 1
-	}
+	zero := frontend.Variable(0)
+	api.AssertIsLessOrEqual(zero, sum)
+	api.AssertIsLessOrEqual(sum, circuit.PublicThreshold)
 
 	// The following is for the polynomial evaluation
-	privateProd := PolyEvalInCircuit(api, processedVec, circuit.PublicR)
+	privateProd := PolyEvalInCircuit(api, circuit.PrivateVec, circuit.PublicR)
 	privateProd = api.Mul(privateProd, circuit.PrivateMask)
 	api.AssertIsEqual(privateProd, circuit.PublicProd)
 
 	// checking commitment
 	mimc, _ := mimc.NewMiMC(api)
-	for i := 0; i < len(circuit.PairFirstVar); i++ {
-		mimc.Write(processedVec[i])
+	for i := 0; i < len(circuit.PrivateVec); i++ {
+		mimc.Write(circuit.PrivateVec[i])
 	}
 	mimc.Write(circuit.PrivateMask)
 	mimc.Write(circuit.PrivateSalt)
 	api.AssertIsEqual(circuit.PublicCommitment, mimc.Sum())
+
 	return nil
 }
 
@@ -147,11 +120,6 @@ func randomFr() fr_bn254.Element {
 	e.SetRandom()
 	return e
 }
-
-//type ClientSubmissionToShuffler struct {
-//	PrivateVec [PrivateShareNum]fr_bn254.Element
-//	DummyVec   [DummyVecLength]fr_bn254.Element
-//}
 
 type ClientSubmissionToServer struct {
 	publicWitness *witness.Witness
@@ -166,12 +134,10 @@ type ClientSubmissionToServerPlonk struct {
 }
 
 type ClientState struct {
-	SortedCandidate []fr_bn254.Element
-	PairFirst       []fr_bn254.Element
-	PairSecond      []fr_bn254.Element
-
-	PrivateX []fr_bn254.Element // the private X are the packed version of the pairs
-	PrivateY []fr_bn254.Element // the private Y are the dummies
+	PrivateVal   int                // the private value
+	PrivateNoise int                // the private noise
+	PrivateX     []fr_bn254.Element // the private X are the shares
+	PrivateY     []fr_bn254.Element // the private Y are the dummies
 
 	PublicCom   fr_bn254.Element
 	PrivateMask fr_bn254.Element
@@ -181,38 +147,21 @@ type ClientState struct {
 	PublicR    fr_bn254.Element
 }
 
-func (c *ClientState) Init() {
-	c.SortedCandidate = make([]fr_bn254.Element, CandidateNum)
-	c.PairFirst = make([]fr_bn254.Element, CandidateNum*(CandidateNum-1)/2)
-	c.PairSecond = make([]fr_bn254.Element, CandidateNum*(CandidateNum-1)/2)
-	c.PrivateX = make([]fr_bn254.Element, CandidateNum*(CandidateNum-1)/2)
+func (c *ClientState) Init(x int, noise int) {
+	c.PrivateVal = x
+	c.PrivateNoise = noise
+	c.PrivateX = make([]fr_bn254.Element, PrivateVecLength)
 	c.PrivateY = make([]fr_bn254.Element, DummyVecLength)
 
-	for i := 0; i < CandidateNum; i++ {
-		c.SortedCandidate[i] = fr_bn254.NewElement(uint64(i))
-	}
+	valueToShare := x + noise + ConstShift // we add big enough shift to make sure the value is positive
 
-	//create a random order of the candidate
-	rand.Shuffle(len(c.SortedCandidate), func(i, j int) {
-		c.SortedCandidate[i], c.SortedCandidate[j] = c.SortedCandidate[j], c.SortedCandidate[i]
-	})
-
-	currentPair := 0
-	for i := 0; i < CandidateNum; i++ {
-		for j := 0; j < CandidateNum-i-1; j++ {
-			p, q := c.SortedCandidate[i], c.SortedCandidate[i+j+1]
-			c.PairFirst[currentPair] = p
-			c.PairSecond[currentPair] = q
-			currentPair += 1
-		}
+	// now we split the value into multiple shares
+	remainingVal := fr_bn254.NewElement(uint64(valueToShare))
+	for i := 0; i < PrivateVecLength-1; i++ {
+		c.PrivateX[i] = randomFr()
+		remainingVal.Sub(&remainingVal, &c.PrivateX[i])
 	}
-
-	for i := 0; i < len(c.PrivateX); i++ {
-		tmp := fr_bn254.NewElement(uint64(CandidateNum))
-		tmp.Mul(&tmp, &c.PairFirst[i])
-		tmp.Add(&tmp, &c.PairSecond[i])
-		c.PrivateX[i] = tmp
-	}
+	c.PrivateX[PrivateVecLength-1] = remainingVal
 
 	// now generate the private dummy
 	for i := 0; i < len(c.PrivateY); i++ {
@@ -247,43 +196,30 @@ func (c *ClientState) ComputePolyEval(publicR fr_bn254.Element) {
 	c.PublicProd = prod
 }
 
-func (c *ClientState) GenAssignment(publicR fr_bn254.Element) VoteCircuit {
-	// first initialize all variables needed in the votecircuit
-	unsortedCandidate := make([]frontend.Variable, CandidateNum)
-	sortedCandidate := make([]frontend.Variable, CandidateNum)
-	pairFirstVar := make([]frontend.Variable, CandidateNum*(CandidateNum-1)/2)
-	pairSecondVar := make([]frontend.Variable, CandidateNum*(CandidateNum-1)/2)
-
-	for i := 0; i < CandidateNum; i++ {
-		unsortedCandidate[i] = frontend.Variable(i)
-		sortedCandidate[i] = frontend.Variable(c.SortedCandidate[i])
+func (c *ClientState) GenAssignment(publicR fr_bn254.Element) SumAndCmpCircuit {
+	// first initialize all the variables in the circuit
+	privateVec := make([]frontend.Variable, PrivateVecLength)
+	for i := 0; i < len(privateVec); i++ {
+		privateVec[i] = frontend.Variable(c.PrivateX[i])
 	}
 
-	for i := 0; i < len(pairFirstVar); i++ {
-		pairFirstVar[i] = frontend.Variable(c.PairFirst[i])
-		pairSecondVar[i] = frontend.Variable(c.PairSecond[i])
-	}
-
-	// now compute the public prod
 	c.ComputePolyEval(publicR)
 	publicProd := frontend.Variable(c.PublicProd)
 
-	// now create the assignment
-	assignment := VoteCircuit{
-		SortedCandidate:  sortedCandidate,
-		PairFirstVar:     pairFirstVar,
-		PairSecondVar:    pairSecondVar,
+	// now we create the assignment
+	assignment := SumAndCmpCircuit{
+		PrivateVec:       privateVec[:],
+		PublicThreshold:  frontend.Variable(fr_bn254.NewElement(uint64(ClientValRange + ConstShift))),
 		PrivateMask:      frontend.Variable(c.PrivateMask),
 		PublicR:          frontend.Variable(publicR),
 		PublicProd:       publicProd,
 		PublicCommitment: frontend.Variable(c.PublicCom),
 		PrivateSalt:      frontend.Variable(c.PrivateSalt),
 	}
-
 	return assignment
 }
 
-func GenProofGroth16(assignment VoteCircuit, ccs *constraint.ConstraintSystem, pk *groth16.ProvingKey) (*groth16.Proof, *witness.Witness) {
+func GenProofGroth16(assignment SumAndCmpCircuit, ccs *constraint.ConstraintSystem, pk *groth16.ProvingKey) (*groth16.Proof, *witness.Witness) {
 	// witness definition
 	witness, _ := frontend.NewWitness(&assignment, ecc.BN254.ScalarField())
 	//fmt.Println(witness)
@@ -295,7 +231,7 @@ func GenProofGroth16(assignment VoteCircuit, ccs *constraint.ConstraintSystem, p
 	return &proof, &publicWitness
 }
 
-func GenProofPlonk(assignment VoteCircuit, ccs *constraint.ConstraintSystem, pk *plonk.ProvingKey) (*plonk.Proof, *witness.Witness) {
+func GenProofPlonk(assignment SumAndCmpCircuit, ccs *constraint.ConstraintSystem, pk *plonk.ProvingKey) (*plonk.Proof, *witness.Witness) {
 	// witness definition
 	witness, _ := frontend.NewWitness(&assignment, ecc.BN254.ScalarField())
 	//fmt.Println(witness)
@@ -307,22 +243,25 @@ func GenProofPlonk(assignment VoteCircuit, ccs *constraint.ConstraintSystem, pk 
 	return &proof, &publicWitness
 }
 
-func VoteGroth16() {
-	DummyVecLength = uint64(ComputeDummyNum(80, ClientNum, CorruptedNum))
+func DPSumGroth16() {
+	// compute the dummy number needed
+	DummyVecLength = ComputeDummyNum(80, ClientNum, CorruptedNum)
 	log.Printf("lambda %v, n %v, t %v, Dummy Num: %v\n", 80, ClientNum, CorruptedNum, DummyVecLength)
 
-	// define a dummy vote circuit
-	var circuit = VoteCircuit{
-		SortedCandidate:  make([]frontend.Variable, CandidateNum),
-		PairFirstVar:     make([]frontend.Variable, CandidateNum*(CandidateNum-1)/2),
-		PairSecondVar:    make([]frontend.Variable, CandidateNum*(CandidateNum-1)/2),
+	// setup the constraint system
+	privateVec := make([]frontend.Variable, PrivateVecLength)
+	for i := 0; i < len(privateVec); i++ {
+		privateVec[i] = frontend.Variable(fr_bn254.NewElement(uint64(0)))
+	}
+	var circuit = SumAndCmpCircuit{
+		PrivateVec:       privateVec[:],
+		PublicThreshold:  0,
 		PrivateMask:      0,
 		PublicR:          0,
 		PublicProd:       0,
 		PublicCommitment: 0,
 		PrivateSalt:      0,
 	}
-
 	ccs, _ := frontend.Compile(ecc.BN254.ScalarField(), r1cs.NewBuilder, &circuit)
 
 	// groth16 zkSNARK: Setup
@@ -330,61 +269,32 @@ func VoteGroth16() {
 
 	var buf bytes.Buffer
 	pk.WriteTo(&buf)
-	// check how many bytes are written
 	provingKeySize := buf.Len()
-	// clean the buffer
 	buf.Reset()
 
-	// Step 1: define n clients
+	// we now setup the client state
 	start := time.Now()
+
 	clients := make([]ClientState, ClientNum)
-	for i := 0; i < len(clients); i++ {
-		clients[i].Init()
+	noise := GenDistributedDPNoise(eps, 1000.0, ClientNum)
+	for i := 0; i < ClientNum; i++ {
+		// here we just give the client a default value of 1000
+		// try change it to 2000 and the proof process will fail
+		clients[i].Init(1000, noise[i])
 	}
 	prepTime := time.Since(start)
 
-	// print the information of the 0-th client
-	fmt.Printf("=====Client 0=====\n")
-	for i := 0; i < len(clients[0].SortedCandidate); i++ {
-		// print the sorted candidate, cast it to uint64
-		fmt.Printf("rank: %v", clients[0].SortedCandidate[i].Uint64())
-	}
-	fmt.Printf("\n")
-	tmpCnt := 0
-	for i := 0; i < CandidateNum; i++ {
-		for j := 0; j < CandidateNum-i-1; j++ {
-			fmt.Printf("(%v, %v)", clients[0].PairFirst[tmpCnt].Uint64(), clients[0].PairSecond[tmpCnt].Uint64())
-			tmpCnt += 1
-		}
-		fmt.Printf("\n")
-	}
-	tmpCnt = 0
-	for i := 0; i < CandidateNum; i++ {
-		for j := 0; j < CandidateNum-i-1; j++ {
-			fmt.Printf("%v ", clients[0].PrivateX[tmpCnt].Uint64())
-			tmpCnt += 1
-		}
-		fmt.Printf("\n")
-	}
-	fmt.Printf("============================\n")
+	shuffledX := make([]fr_bn254.Element, ClientNum*PrivateVecLength)
 
-	// DATA COLLECTION PHASE: each client submits its votes to the shuffler
-
-	shuffledPairFirst := make([]fr_bn254.Element, ClientNum*(CandidateNum*(CandidateNum-1)/2))
-	shuffledPairSecond := make([]fr_bn254.Element, ClientNum*(CandidateNum*(CandidateNum-1)/2))
-
-	voteCnt := 0
-	for i := 0; i < len(clients); i++ {
-		for j := 0; j < len(clients[i].PairFirst); j++ {
-			shuffledPairFirst[voteCnt] = clients[i].PairFirst[j]
-			shuffledPairSecond[voteCnt] = clients[i].PairSecond[j]
-			voteCnt += 1
+	// DATA COLLECTION PHASE: each client submits its private value to the shuffler
+	for i := 0; i < ClientNum; i++ {
+		for j := 0; j < len(clients[i].PrivateX); j++ {
+			shuffledX[i*PrivateVecLength+j] = clients[i].PrivateX[j]
 		}
 	}
-	// shuffled the votes. Shuffle the pairFirst and pairSecond with the same permutation
-	rand.Shuffle(len(shuffledPairFirst), func(i, j int) {
-		shuffledPairFirst[i], shuffledPairFirst[j] = shuffledPairFirst[j], shuffledPairFirst[i]
-		shuffledPairSecond[i], shuffledPairSecond[j] = shuffledPairSecond[j], shuffledPairSecond[i]
+	// shuffle the shuffledX
+	rand.Shuffle(len(shuffledX), func(i, j int) {
+		shuffledX[i], shuffledX[j] = shuffledX[j], shuffledX[i]
 	})
 
 	// DETECTION PHASE:
@@ -395,13 +305,12 @@ func VoteGroth16() {
 	// c) send the commitment to the server
 
 	allDummies := make([]fr_bn254.Element, ClientNum*DummyVecLength)
-	dummyCnt := 0
-	for i := 0; i < len(clients); i++ {
+	for i := 0; i < ClientNum; i++ {
 		for j := 0; j < len(clients[i].PrivateY); j++ {
-			allDummies[dummyCnt] = clients[i].PrivateY[j]
-			dummyCnt += 1
+			allDummies[i*int(DummyVecLength)+j] = clients[i].PrivateY[j]
 		}
 	}
+
 	// shuffle the dummies
 	rand.Shuffle(len(allDummies), func(i, j int) {
 		allDummies[i], allDummies[j] = allDummies[j], allDummies[i]
@@ -418,10 +327,11 @@ func VoteGroth16() {
 	// Step 3:
 	// now the clients can compute the assignment
 	start = time.Now()
-	allAssignment := make([]VoteCircuit, ClientNum)
+	allAssignment := make([]SumAndCmpCircuit, ClientNum)
 	for i := 0; i < len(clients); i++ {
 		allAssignment[i] = clients[i].GenAssignment(publicR)
 	}
+
 	prepTime += time.Since(start)
 
 	// now the clients can compute the proofs
@@ -457,7 +367,11 @@ func VoteGroth16() {
 		buf.Reset()
 	}
 
-	// now the server can verify the proofs
+	// Step 4:
+	// a) The server verfies all the proofs
+	// b) The server checks the polynomial evaluations
+	// c) The server computes the sum of all the secret values
+
 	start = time.Now()
 	for i := 0; i < len(allSubmission); i++ {
 		if i < MaxNumOfCheckProof {
@@ -469,29 +383,15 @@ func VoteGroth16() {
 	}
 	verifyTime := time.Since(start)
 
-	// finally, the server verifies the polynomial evaluations
-	start = time.Now()
-
-	processedVec := make([]fr_bn254.Element, len(shuffledPairFirst))
-	for i := 0; i < len(shuffledPairFirst); i++ {
-		tmp := fr_bn254.NewElement(uint64(CandidateNum))
-		tmp.Mul(&tmp, &shuffledPairFirst[i])
-		tmp.Add(&tmp, &shuffledPairSecond[i])
-		processedVec[i] = tmp
-	}
-	prodFromShuffler := PolyEval(processedVec, publicR)
-	for i := 0; i < len(allDummies); i++ {
-		prodFromShuffler.Mul(&prodFromShuffler, &allDummies[i])
-	}
-
-	// print the product from the shuffler
-	fmt.Printf("prodFromShuffler: %v\n", prodFromShuffler)
-
 	prodFromClient := fr_bn254.NewElement(uint64(1))
-	for i := 0; i < len(clients); i++ {
+	for i := 0; i < ClientNum; i++ {
 		prodFromClient.Mul(&prodFromClient, &allSubmission[i].publicProd)
 	}
 
+	prodFromShuffler := PolyEval(shuffledX, publicR)
+	for i := 0; i < len(allDummies); i++ {
+		prodFromShuffler.Mul(&prodFromShuffler, &allDummies[i])
+	}
 	// now the server compares the prodFromShuffler and the prodFromClients
 	if !prodFromShuffler.Equal(&prodFromClient) {
 		fmt.Printf("The product from the shuffler and the product from the clients are not equal\n")
@@ -499,52 +399,20 @@ func VoteGroth16() {
 
 	serverTime := time.Since(start)
 
-	// now we see if there is any sole winner
-	comparisonVoteCnt := make([][]uint64, CandidateNum)
-	for i := 0; i < len(comparisonVoteCnt); i++ {
-		comparisonVoteCnt[i] = make([]uint64, CandidateNum)
-	}
-	for i := 0; i < len(shuffledPairFirst); i++ {
-		comparisonVoteCnt[shuffledPairFirst[i].Uint64()][shuffledPairSecond[i].Uint64()] += 1
-	}
-	soleWinner := -1
-	for i := 0; i < CandidateNum; i++ {
-		ok := true
-		for j := 0; j < CandidateNum; j++ {
-			if i != j && comparisonVoteCnt[i][j] <= comparisonVoteCnt[j][i] {
-				ok = false
-				break
-			}
-			if i != j && comparisonVoteCnt[i][j]+comparisonVoteCnt[j][i] != ClientNum {
-				fmt.Print("The comparison is not correct\n")
-			}
-		}
-		if ok {
-			fmt.Printf("The sole winner is %v\n", i)
-			// print the vote for the sole winner
-			for j := 0; j < CandidateNum; j++ {
-				fmt.Printf("%v ", comparisonVoteCnt[i][j])
-			}
-			soleWinner = i
-		}
-	}
-	if soleWinner == -1 {
-		fmt.Printf("There is no sole winner\n")
+	// the server then computes the sum of all the secret values
+	sum := fr_bn254.NewElement(uint64(0))
+	for i := 0; i < len(shuffledX); i++ {
+		sum.Add(&sum, &shuffledX[i])
 	}
 
-	//now we compute the cost
-
-	// now we compute the communication
-	// the client sends the commitments to the server
-	// the server broadcasts the challenge
-	// the client sends the public witness and the proof to the server
+	fmt.Printf("The computed sum is %v\n", sum.Uint64())
 
 	proofRelatedCommCost := uint64(proofSize) // + publicWitnessSize
 	//commCost := (float64(dummyCostPerClient) + float64(proofSize) + float64(publicWitnessSize) + float64(CommitmentSize) + float64(BN254Size)) / 1024
 	dummyCostPerClient := DummyVecLength * uint64(BN254Size)
 	commCost := uint64(proofSize) + uint64(publicWitnessSize) + BN254Size + CommitmentSize + dummyCostPerClient
 
-	log.Print("========Stats (Voting w/ Groth16 Proof)======\n")
+	log.Print("========Stats (DP Sum w/ Groth16 Proof)======\n")
 	nbConstraints := ccs.GetNbConstraints()
 	log.Printf("Number of Constraints: %v\n", nbConstraints)
 	log.Printf("============================\n")
@@ -584,7 +452,7 @@ func VoteGroth16() {
 	log.Printf("Proving Key: %v\n", provingKeySize)
 	log.Printf("============================\n")
 
-	s := fmt.Sprintf("Voting Groth16, %v, %v, %v, %v, %v, %v, %v\n",
+	s := fmt.Sprintf("DP Sum Groth16, %v, %v, %v, %v, %v, %v, %v\n",
 		nbConstraints,
 		ClientNum,
 		ClientNum-CorruptedNum,
@@ -595,15 +463,19 @@ func VoteGroth16() {
 	file.WriteString(s)
 }
 
-func VotePlonk() {
-	DummyVecLength = uint64(ComputeDummyNum(80, ClientNum, CorruptedNum))
+func DPSumPlonk() {
+	// compute the dummy number needed
+	DummyVecLength = ComputeDummyNum(80, ClientNum, CorruptedNum)
 	log.Printf("lambda %v, n %v, t %v, Dummy Num: %v\n", 80, ClientNum, CorruptedNum, DummyVecLength)
 
-	// define a dummy vote circuit
-	var circuit = VoteCircuit{
-		SortedCandidate:  make([]frontend.Variable, CandidateNum),
-		PairFirstVar:     make([]frontend.Variable, CandidateNum*(CandidateNum-1)/2),
-		PairSecondVar:    make([]frontend.Variable, CandidateNum*(CandidateNum-1)/2),
+	// setup the constraint system
+	privateVec := make([]frontend.Variable, PrivateVecLength)
+	for i := 0; i < len(privateVec); i++ {
+		privateVec[i] = frontend.Variable(fr_bn254.NewElement(uint64(0)))
+	}
+	var circuit = SumAndCmpCircuit{
+		PrivateVec:       privateVec[:],
+		PublicThreshold:  0,
 		PrivateMask:      0,
 		PublicR:          0,
 		PublicProd:       0,
@@ -632,56 +504,29 @@ func VotePlonk() {
 	// clean the buffer
 	buf.Reset()
 
-	// Step 1: define n clients
+	// we now setup the client state
 	start := time.Now()
+
 	clients := make([]ClientState, ClientNum)
-	for i := 0; i < len(clients); i++ {
-		clients[i].Init()
+	noise := GenDistributedDPNoise(eps, 1000.0, ClientNum)
+	for i := 0; i < ClientNum; i++ {
+		// here we just give the client a default value of 1000
+		// try change it to 2000 and the proof process will fail
+		clients[i].Init(1000, noise[i])
 	}
 	prepTime := time.Since(start)
 
-	// print the information of the 0-th client
-	fmt.Printf("=====Client 0=====\n")
-	for i := 0; i < len(clients[0].SortedCandidate); i++ {
-		// print the sorted candidate, cast it to uint64
-		fmt.Printf("rank: %v", clients[0].SortedCandidate[i].Uint64())
-	}
-	fmt.Printf("\n")
-	tmpCnt := 0
-	for i := 0; i < CandidateNum; i++ {
-		for j := 0; j < CandidateNum-i-1; j++ {
-			fmt.Printf("(%v, %v)", clients[0].PairFirst[tmpCnt].Uint64(), clients[0].PairSecond[tmpCnt].Uint64())
-			tmpCnt += 1
-		}
-		fmt.Printf("\n")
-	}
-	tmpCnt = 0
-	for i := 0; i < CandidateNum; i++ {
-		for j := 0; j < CandidateNum-i-1; j++ {
-			fmt.Printf("%v ", clients[0].PrivateX[tmpCnt].Uint64())
-			tmpCnt += 1
-		}
-		fmt.Printf("\n")
-	}
-	fmt.Printf("============================\n")
+	shuffledX := make([]fr_bn254.Element, ClientNum*PrivateVecLength)
 
-	// DATA COLLECTION PHASE: each client submits its votes to the shuffler
-
-	shuffledPairFirst := make([]fr_bn254.Element, ClientNum*(CandidateNum*(CandidateNum-1)/2))
-	shuffledPairSecond := make([]fr_bn254.Element, ClientNum*(CandidateNum*(CandidateNum-1)/2))
-
-	voteCnt := 0
-	for i := 0; i < len(clients); i++ {
-		for j := 0; j < len(clients[i].PairFirst); j++ {
-			shuffledPairFirst[voteCnt] = clients[i].PairFirst[j]
-			shuffledPairSecond[voteCnt] = clients[i].PairSecond[j]
-			voteCnt += 1
+	// DATA COLLECTION PHASE: each client submits its private value to the shuffler
+	for i := 0; i < ClientNum; i++ {
+		for j := 0; j < len(clients[i].PrivateX); j++ {
+			shuffledX[i*PrivateVecLength+j] = clients[i].PrivateX[j]
 		}
 	}
-	// shuffled the votes. Shuffle the pairFirst and pairSecond with the same permutation
-	rand.Shuffle(len(shuffledPairFirst), func(i, j int) {
-		shuffledPairFirst[i], shuffledPairFirst[j] = shuffledPairFirst[j], shuffledPairFirst[i]
-		shuffledPairSecond[i], shuffledPairSecond[j] = shuffledPairSecond[j], shuffledPairSecond[i]
+	// shuffle the shuffledX
+	rand.Shuffle(len(shuffledX), func(i, j int) {
+		shuffledX[i], shuffledX[j] = shuffledX[j], shuffledX[i]
 	})
 
 	// DETECTION PHASE:
@@ -692,13 +537,12 @@ func VotePlonk() {
 	// c) send the commitment to the server
 
 	allDummies := make([]fr_bn254.Element, ClientNum*DummyVecLength)
-	dummyCnt := 0
-	for i := 0; i < len(clients); i++ {
+	for i := 0; i < ClientNum; i++ {
 		for j := 0; j < len(clients[i].PrivateY); j++ {
-			allDummies[dummyCnt] = clients[i].PrivateY[j]
-			dummyCnt += 1
+			allDummies[i*int(DummyVecLength)+j] = clients[i].PrivateY[j]
 		}
 	}
+
 	// shuffle the dummies
 	rand.Shuffle(len(allDummies), func(i, j int) {
 		allDummies[i], allDummies[j] = allDummies[j], allDummies[i]
@@ -715,10 +559,11 @@ func VotePlonk() {
 	// Step 3:
 	// now the clients can compute the assignment
 	start = time.Now()
-	allAssignment := make([]VoteCircuit, ClientNum)
+	allAssignment := make([]SumAndCmpCircuit, ClientNum)
 	for i := 0; i < len(clients); i++ {
 		allAssignment[i] = clients[i].GenAssignment(publicR)
 	}
+
 	prepTime += time.Since(start)
 
 	// now the clients can compute the proofs
@@ -754,7 +599,11 @@ func VotePlonk() {
 		buf.Reset()
 	}
 
-	// now the server can verify the proofs
+	// Step 4:
+	// a) The server verfies all the proofs
+	// b) The server checks the polynomial evaluations
+	// c) The server computes the sum of all the secret values
+
 	start = time.Now()
 	for i := 0; i < len(allSubmission); i++ {
 		if i < MaxNumOfCheckProof {
@@ -766,29 +615,15 @@ func VotePlonk() {
 	}
 	verifyTime := time.Since(start)
 
-	// finally, the server verifies the polynomial evaluations
-	start = time.Now()
-
-	processedVec := make([]fr_bn254.Element, len(shuffledPairFirst))
-	for i := 0; i < len(shuffledPairFirst); i++ {
-		tmp := fr_bn254.NewElement(uint64(CandidateNum))
-		tmp.Mul(&tmp, &shuffledPairFirst[i])
-		tmp.Add(&tmp, &shuffledPairSecond[i])
-		processedVec[i] = tmp
-	}
-	prodFromShuffler := PolyEval(processedVec, publicR)
-	for i := 0; i < len(allDummies); i++ {
-		prodFromShuffler.Mul(&prodFromShuffler, &allDummies[i])
-	}
-
-	// print the product from the shuffler
-	fmt.Printf("prodFromShuffler: %v\n", prodFromShuffler)
-
 	prodFromClient := fr_bn254.NewElement(uint64(1))
-	for i := 0; i < len(clients); i++ {
+	for i := 0; i < ClientNum; i++ {
 		prodFromClient.Mul(&prodFromClient, &allSubmission[i].publicProd)
 	}
 
+	prodFromShuffler := PolyEval(shuffledX, publicR)
+	for i := 0; i < len(allDummies); i++ {
+		prodFromShuffler.Mul(&prodFromShuffler, &allDummies[i])
+	}
 	// now the server compares the prodFromShuffler and the prodFromClients
 	if !prodFromShuffler.Equal(&prodFromClient) {
 		fmt.Printf("The product from the shuffler and the product from the clients are not equal\n")
@@ -796,52 +631,20 @@ func VotePlonk() {
 
 	serverTime := time.Since(start)
 
-	// now we see if there is any sole winner
-	comparisonVoteCnt := make([][]uint64, CandidateNum)
-	for i := 0; i < len(comparisonVoteCnt); i++ {
-		comparisonVoteCnt[i] = make([]uint64, CandidateNum)
-	}
-	for i := 0; i < len(shuffledPairFirst); i++ {
-		comparisonVoteCnt[shuffledPairFirst[i].Uint64()][shuffledPairSecond[i].Uint64()] += 1
-	}
-	soleWinner := -1
-	for i := 0; i < CandidateNum; i++ {
-		ok := true
-		for j := 0; j < CandidateNum; j++ {
-			if i != j && comparisonVoteCnt[i][j] <= comparisonVoteCnt[j][i] {
-				ok = false
-				break
-			}
-			if i != j && comparisonVoteCnt[i][j]+comparisonVoteCnt[j][i] != ClientNum {
-				fmt.Print("The comparison is not correct\n")
-			}
-		}
-		if ok {
-			fmt.Printf("The sole winner is %v\n", i)
-			// print the vote for the sole winner
-			for j := 0; j < CandidateNum; j++ {
-				fmt.Printf("%v ", comparisonVoteCnt[i][j])
-			}
-			soleWinner = i
-		}
-	}
-	if soleWinner == -1 {
-		fmt.Printf("There is no sole winner\n")
+	// the server then computes the sum of all the secret values
+	sum := fr_bn254.NewElement(uint64(0))
+	for i := 0; i < len(shuffledX); i++ {
+		sum.Add(&sum, &shuffledX[i])
 	}
 
-	//now we compute the cost
-
-	// now we compute the communication
-	// the client sends the commitments to the server
-	// the server broadcasts the challenge
-	// the client sends the public witness and the proof to the server
+	fmt.Printf("The computed sum is %v\n", sum.Uint64())
 
 	proofRelatedCommCost := uint64(proofSize) // + publicWitnessSize
 	//commCost := (float64(dummyCostPerClient) + float64(proofSize) + float64(publicWitnessSize) + float64(CommitmentSize) + float64(BN254Size)) / 1024
 	dummyCostPerClient := DummyVecLength * uint64(BN254Size)
 	commCost := uint64(proofSize) + uint64(publicWitnessSize) + BN254Size + CommitmentSize + dummyCostPerClient
 
-	log.Print("========Stats (Voting w/ Plonk)======\n")
+	log.Print("========Stats (DP Sum w/ Plonk Proof)======\n")
 	nbConstraints := ccs.GetNbConstraints()
 	log.Printf("Number of Constraints: %v\n", nbConstraints)
 	log.Printf("============================\n")
@@ -881,7 +684,7 @@ func VotePlonk() {
 	log.Printf("Proving Key: %v\n", provingKeySize)
 	log.Printf("============================\n")
 
-	s := fmt.Sprintf("Voting Plonk, %v, %v, %v, %v, %v, %v, %v\n",
+	s := fmt.Sprintf("DP Sum Plonk, %v, %v, %v, %v, %v, %v, %v\n",
 		nbConstraints,
 		ClientNum,
 		ClientNum-CorruptedNum,
@@ -892,9 +695,75 @@ func VotePlonk() {
 	file.WriteString(s)
 }
 
+func GenPolyaPDF(r float64, p float64) []float64 {
+	// Generate the PDF for distribution Polya(r, p) for k= 0...99
+	fmt.Printf("%v %v\n", r, p)
+	ptor := math.Pow(p, r)
+	t := 1.0
+	accu := math.Gamma(r) // accu_k = gamma(k + r) / k!
+	prob := 1.0           // the remaining probability
+	pdf := make([]float64, NoiseRange)
+
+	for k := 0; k < len(pdf); k++ {
+		density := accu / math.Gamma(r) * t * ptor
+		prob = prob - density
+		pdf[k] = density
+		//fmt.Printf("%v %v\n", k, density)
+		t = t * (1 - p)
+		accu = accu * (float64(k) + r) / (float64(k) + 1.0)
+	}
+
+	fmt.Printf("reamining prob: %v\n", prob)
+	pdf[len(pdf)-1] += prob // truncate it at 99, move the remaining prob to 0
+
+	return pdf
+}
+
+type DistributionWithPDF struct {
+	pdf []float64
+	src *rand.Rand
+}
+
+func (w DistributionWithPDF) Sample() int {
+	// sample a random variable according to the pdf stored in w.pdf
+	randNum := w.src.Float64()
+	accu := 0.0
+	for i := 0; i < len(w.pdf); i++ {
+		accu += w.pdf[i]
+		if accu >= randNum {
+			return i
+		}
+	}
+	return 0
+}
+
+func GenDistributedDPNoise(eps float64, sensitivity float64, n int) []int {
+	// the pdf shows the PDF for Polya(1/n, e^{-eps/sensitivity}) of k=0...99
+	pdf := GenPolyaPDF(1.0/float64(n), 1-math.Exp(-eps/sensitivity))
+	//fmt.Printf("%v\n", pdf)
+
+	w := DistributionWithPDF{pdf: pdf, src: rand.New(rand.NewSource(time.Now().UnixNano()))}
+
+	// create the return slice of length n
+	noise := make([]int, n)
+	sum := 0
+
+	for i := 0; i < n; i++ {
+		// sample a random variable between 0 to 99 according to the probability densities stored in pdf
+		p1 := w.Sample()
+		p2 := w.Sample()
+		//fmt.Printf("%v %v\n", p1, p2)
+		noise[i] = p1 - p2
+		sum += noise[i]
+	}
+
+	fmt.Printf("noise sum: %v\n", sum)
+	return noise
+}
+
 func main() {
 	var err error
-	file, err = os.OpenFile("output-vote.csv", os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
+	file, err = os.OpenFile("output-shuffle-dp-sum.csv", os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
 	if err != nil {
 		panic(err)
 	}
@@ -904,12 +773,10 @@ func main() {
 	file.WriteString("Name, #Const, #Client, #Honest, Client Time, Server Time, Comm Cost, Proving Key Size\n")
 
 	for t := 0; t < TestRepeat; t++ {
-		VoteGroth16()
+		DPSumGroth16()
 	}
 
 	for t := 0; t < TestRepeat; t++ {
-		VotePlonk()
+		DPSumPlonk()
 	}
-
-	//ShuffleZKPlonk()
 }
